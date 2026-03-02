@@ -234,15 +234,16 @@ function compile(verilog, work, label, svFiles, { forBmc = false, extraFlags = [
 }
 
 function simulate(sim, mlirPath, { top = 'tb', extraArgs = [] } = {}) {
-  if (!fs.existsSync(mlirPath)) {
-    return { ok: false, reason: 'MLIR output not written', output: '', exitCode: 1 };
-  }
-  // circt-sim uses NODERAWFS in Node.js builds — pass the native mlirPath directly.
+  let mlir;
+  try { mlir = fs.readFileSync(mlirPath, 'utf8'); }
+  catch { return { ok: false, reason: 'MLIR output not written', output: '', exitCode: 1 }; }
+  // circt-sim uses MEMFS in Node.js builds — pass content via virtual FS path.
+  const vpath = '/workspace/sim.mlir';
   const { exitCode, stdout, stderr } = sim.invoke(
-    {},
-    ['--top', top, ...extraArgs, mlirPath],
+    { [vpath]: mlir },
+    ['--top', top, ...extraArgs, vpath],
   );
-  return { ok: true, output: stdout + stderr, exitCode };
+  return { ok: exitCode === 0, output: stdout + stderr, exitCode };
 }
 
 // Run circt-bmc (NODERAWFS — uses real filesystem paths).
@@ -275,8 +276,9 @@ async function runMlirLesson({ sim, slug, lessonDir, results }) {
     const content = fs.readFileSync(nativeMlirPath, 'utf8');
     const m = content.match(/hw\.module\s+@(\w+)/);
     const topModule = m ? m[1] : 'top';
-    // circt-sim uses NODERAWFS in Node.js builds — pass the native path directly.
-    const { exitCode, stdout, stderr } = sim.invoke({}, ['--top', topModule, nativeMlirPath]);
+    // circt-sim uses MEMFS in Node.js builds — pass content via virtual FS path.
+    const vpath = '/workspace/sim.mlir';
+    const { exitCode, stdout, stderr } = sim.invoke({ [vpath]: content }, ['--top', topModule, vpath]);
     if (exitCode === 0) {
       console.log(`  ${G}ok${X}`);
       results.pass++;
@@ -406,13 +408,9 @@ const SKIP_SOL_PASS = new Set([
 // Bug report files live in docs/circt-bugs/.
 // GitHub issues: https://github.com/thomasnormal/circt/issues
 const CIRCT_XFAIL = new Map([
-  // #20: interface signal writes in automatic tasks don't drive DUT ports.
-  //  #8 (sim hang) is fixed; tasks can now detect clock edges. But vif.we/addr/wdata
-  //  writes only update the LLVM backing store — hw.instance "dut" @sram was
-  //  connected to one-time snapshot values at module init; DUT never sees updates.
-  //  Also, DUT rdata output is stored to backing store once at init ('x'), never updated.
-  ['sv/tasks-functions',
-   'circt#20: interface signal writes in tasks don\'t drive DUT ports'],
+  // $bits() on hierarchical ref to parameterized port — regression still present.
+  // $bits(u_small.addr) returns wrong value; SRAM data checks pass but $bits check fails.
+  ['sv/parameters', '$bits() on hierarchical ref to parameterized port'],
 
   // #14: virtual mem_if in UVM class method → Aborted when interface is in separate file
   //  #10 fixed the single-file case; multi-file --single-unit still crashes
@@ -575,7 +573,7 @@ async function runLesson({ verilog, bmc, work, category, slug, lessonDir, result
   } else if (skipSolPass) {
     // Observation lesson: verify the solution runs without crashing, no PASS expected.
     const solSim = simulate(sim, solCompile.mlirPath, { top: topName, extraArgs: simExtra });
-    if (solSim.exitCode === 0 || solSim.ok) {
+    if (solSim.ok) {
       process.stdout.write(`  ${Y}sol=RAN${X}`);  // neutral — no PASS expected
       results.skip++;
     } else {
